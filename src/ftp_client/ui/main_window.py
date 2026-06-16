@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import sys
 import threading
 import tempfile
 from dataclasses import dataclass
@@ -133,9 +137,11 @@ class MainWindow(QMainWindow):
         self.current_local_path = Path.home()
         self.task_rows: dict[int, int] = {}
         self.open_after_download: dict[int, Path] = {}
+        self.remote_open_cache_dir = default_remote_open_cache_dir()
         self.dark_theme = False
         self.remote_busy = False
         self._cursor_busy = False
+        self._clear_remote_open_cache()
 
         self.transfer_manager = TransferManager(
             config_provider=lambda: self.active_config,
@@ -431,7 +437,7 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_local_panel(self) -> QWidget:
-        panel = QGroupBox("左侧：本地文件")
+        panel = QGroupBox("本地文件")
         panel.setMinimumWidth(380)
         layout = QVBoxLayout(panel)
         layout.setSpacing(8)
@@ -472,7 +478,7 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_remote_panel(self) -> QWidget:
-        panel = QGroupBox("右侧：远端服务器")
+        panel = QGroupBox("远端服务器")
         panel.setMinimumWidth(480)
         layout = QVBoxLayout(panel)
         layout.setSpacing(8)
@@ -901,11 +907,11 @@ class MainWindow(QMainWindow):
         if not path.exists():
             self._show_message("打开文件", f"文件不存在：{path}")
             return
-        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        opened, detail = open_path_with_system(path)
         if opened:
-            self.statusBar().showMessage(f"已用系统默认程序打开：{path.name}")
+            self.statusBar().showMessage(f"已请求系统默认程序打开：{path.name}")
         else:
-            self._show_message("打开文件失败", f"系统没有找到可打开该文件的默认程序：{path}")
+            self._show_message("打开文件失败", f"系统没有找到可打开该文件的默认程序：{path}\n{detail}")
 
     def open_remote_entry(self, entry: FtpEntry) -> None:
         if entry.is_dir or entry.type == FtpEntryType.LINK:
@@ -918,13 +924,20 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"正在下载并准备打开：{entry.name}")
 
     def _remote_open_cache_dir(self) -> Path:
-        cache_dir = Path(tempfile.gettempdir()) / "featherftp-open"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return cache_dir
+        self.remote_open_cache_dir.mkdir(parents=True, exist_ok=True)
+        return self.remote_open_cache_dir
 
     def _safe_temp_filename(self, filename: str) -> str:
         safe = "".join("_" if char in '<>:"/\\|?*' else char for char in filename).strip()
         return safe or "remote-file"
+
+    def _clear_remote_open_cache(self) -> None:
+        if not self.remote_open_cache_dir.exists():
+            return
+        try:
+            shutil.rmtree(self.remote_open_cache_dir)
+        except OSError:
+            pass
 
     def create_local_folder(self) -> None:
         name, ok = QInputDialog.getText(self, "新建本地目录", "目录名称：")
@@ -1286,6 +1299,202 @@ class MainWindow(QMainWindow):
         item = table.itemAt(position)
         if item is not None:
             table.selectRow(item.row())
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._clear_remote_open_cache()
+        super().closeEvent(event)
+
+
+def open_path_with_system(path: Path) -> tuple[bool, str]:
+    path = path.expanduser().resolve()
+    errors: list[str] = []
+
+    if is_wsl():
+        return open_path_from_wsl(path, errors)
+
+    if sys.platform.startswith("win"):
+        try:
+            os.startfile(str(path))  # type: ignore[attr-defined]
+            return True, ""
+        except OSError as exc:
+            errors.append(f"Windows startfile 失败：{exc}")
+
+    if sys.platform == "darwin":
+        if run_open_command(["open", str(path)], errors):
+            return True, ""
+
+    if sys.platform.startswith("linux"):
+        for opener in ["gio", "xdg-open"]:
+            executable = shutil.which(opener)
+            if not executable:
+                continue
+            command = [executable, "open", str(path)] if opener == "gio" else [executable, str(path)]
+            if run_open_command(command, errors):
+                return True, ""
+
+    if QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+        return True, ""
+    errors.append("Qt openUrl 未能打开该路径。")
+    return False, "\n".join(errors)
+
+
+def open_path_from_wsl(path: Path, errors: list[str]) -> tuple[bool, str]:
+    for command in wsl_open_commands(path):
+        if run_open_command(command, errors):
+            return True, ""
+    errors.append("WSL 下没有成功调用 Windows 的文件打开器。")
+    return False, "\n".join(errors)
+
+
+def run_open_command(command: list[str], errors: list[str]) -> bool:
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            return process.wait(timeout=2.0) == 0
+        except subprocess.TimeoutExpired:
+            return True
+    except OSError as exc:
+        errors.append(f"{' '.join(command)} 失败：{exc}")
+        return False
+
+
+def is_wsl() -> bool:
+    if "WSL_DISTRO_NAME" in os.environ:
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text(encoding="utf-8").lower()
+    except OSError:
+        return False
+
+
+def wsl_open_commands(path: Path) -> list[list[str]]:
+    commands: list[list[str]] = []
+    win_path = wsl_to_windows_path(path)
+    notepad = shutil.which("notepad.exe")
+    if win_path and notepad and is_plain_text_file(path):
+        commands.append([notepad, win_path])
+
+    explorer = shutil.which("explorer.exe")
+    if win_path and explorer:
+        commands.append([explorer, win_path])
+
+    powershell = shutil.which("powershell.exe")
+    if win_path and powershell:
+        commands.append(
+            [
+                powershell,
+                "-NoProfile",
+                "-Command",
+                f"Invoke-Item -LiteralPath {quote_powershell_string(win_path)}",
+            ]
+        )
+    cmd_exe = shutil.which("cmd.exe")
+    if win_path and cmd_exe:
+        commands.append([cmd_exe, "/C", "start", "", win_path])
+
+    wslview = shutil.which("wslview")
+    if wslview:
+        commands.append([wslview, str(path)])
+    return commands
+
+
+def is_plain_text_file(path: Path) -> bool:
+    return path.suffix.lower() in {
+        ".bat",
+        ".cfg",
+        ".conf",
+        ".css",
+        ".csv",
+        ".env",
+        ".gitignore",
+        ".html",
+        ".ini",
+        ".js",
+        ".json",
+        ".log",
+        ".md",
+        ".py",
+        ".sh",
+        ".toml",
+        ".txt",
+        ".xml",
+        ".yaml",
+        ".yml",
+    } or path.name.lower() in {"readme", "license", "makefile"}
+
+
+def default_remote_open_cache_dir() -> Path:
+    if is_wsl():
+        windows_temp = windows_temp_dir_from_wsl()
+        if windows_temp:
+            return windows_temp / "FeatherFTP-open"
+    return Path(tempfile.gettempdir()) / "featherftp-open"
+
+
+def windows_temp_dir_from_wsl() -> Path | None:
+    for candidate in windows_temp_candidates_from_mount():
+        if candidate.exists():
+            return candidate
+
+    cmd_exe = shutil.which("cmd.exe")
+    if not cmd_exe:
+        return None
+    try:
+        result = subprocess.run(
+            [cmd_exe, "/C", "echo", "%TEMP%"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    windows_path = result.stdout.strip()
+    if not windows_path:
+        return None
+    try:
+        converted = subprocess.run(
+            ["wslpath", "-u", windows_path],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return Path(converted.stdout.strip())
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def windows_temp_candidates_from_mount() -> list[Path]:
+    candidates: list[Path] = []
+    users_root = Path("/mnt/c/Users")
+    current_user = os.environ.get("USER") or os.environ.get("USERNAME")
+    if current_user:
+        candidates.append(users_root / current_user / "AppData" / "Local" / "Temp")
+    if users_root.exists():
+        ignored = {"all users", "default", "default user", "public"}
+        for child in users_root.iterdir():
+            if not child.is_dir() or child.name.lower() in ignored:
+                continue
+            temp_dir = child / "AppData" / "Local" / "Temp"
+            if temp_dir not in candidates:
+                candidates.append(temp_dir)
+    return candidates
+
+
+def wsl_to_windows_path(path: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["wslpath", "-w", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+
+def quote_powershell_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def remote_join(directory: str, name: str) -> str:

@@ -28,6 +28,7 @@ FTP client library.
 WSL or Linux:
 
 ```bash
+.venv/bin/python scripts/run_demo_ftp_server.py
 bash scripts/run.sh
 ```
 
