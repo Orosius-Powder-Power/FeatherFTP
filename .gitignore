@@ -65,3 +65,6 @@ reference/
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+# 文件传输测试产物
+product/

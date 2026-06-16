@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QObject, Qt, Signal, Slot
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QMimeData, QModelIndex, QObject, QPoint, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QDrag
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -60,6 +61,54 @@ class LocalEntry:
     size: int | None
     modified: datetime | None
     is_parent: bool = False
+
+
+class FileTableWidget(QTableWidget):
+    files_dropped = Signal(str)
+
+    def __init__(self, panel_name: str) -> None:
+        super().__init__(0, 0)
+        self.panel_name = panel_name
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDefaultDropAction(Qt.CopyAction)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+
+    def startDrag(self, supported_actions) -> None:  # noqa: N802 - Qt override
+        if not self.selectionModel().selectedRows():
+            return
+        mime = QMimeData()
+        mime.setData("application/x-featherftp-panel", self.panel_name.encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.CopyAction)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._accepts_panel_drop(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._accepts_panel_drop(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if not self._accepts_panel_drop(event):
+            event.ignore()
+            return
+        source_panel = bytes(event.mimeData().data("application/x-featherftp-panel")).decode("utf-8")
+        self.files_dropped.emit(source_panel)
+        event.acceptProposedAction()
+
+    def _accepts_panel_drop(self, event) -> bool:
+        if not event.mimeData().hasFormat("application/x-featherftp-panel"):
+            return False
+        source_panel = bytes(event.mimeData().data("application/x-featherftp-panel")).decode("utf-8")
+        return source_panel != self.panel_name
 
 
 class MainWindow(QMainWindow):
@@ -396,15 +445,19 @@ class MainWindow(QMainWindow):
         path_row.addWidget(local_up_button)
         path_row.addWidget(local_choose_button)
 
-        self.local_table = QTableWidget(0, 4)
+        self.local_table = FileTableWidget("local")
+        self.local_table.setColumnCount(4)
         self.local_table.setHorizontalHeaderLabels(["名称", "大小", "类型", "修改时间"])
         self.local_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.local_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.local_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.local_table.setAlternatingRowColors(True)
+        self.local_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.local_table.verticalHeader().setVisible(False)
         self.local_table.verticalHeader().setDefaultSectionSize(34)
         self.local_table.doubleClicked.connect(self.local_double_clicked)
+        self.local_table.customContextMenuRequested.connect(self.show_local_context_menu)
+        self.local_table.files_dropped.connect(self.handle_drop_on_local)
         self.local_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for column in range(1, 4):
             self.local_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
@@ -430,15 +483,19 @@ class MainWindow(QMainWindow):
         path_row.addWidget(go_button)
         layout.addLayout(path_row)
 
-        self.remote_table = QTableWidget(0, 5)
+        self.remote_table = FileTableWidget("remote")
+        self.remote_table.setColumnCount(5)
         self.remote_table.setHorizontalHeaderLabels(["名称", "类型", "大小", "修改时间", "权限"])
         self.remote_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.remote_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.remote_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.remote_table.setAlternatingRowColors(True)
+        self.remote_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.remote_table.verticalHeader().setVisible(False)
         self.remote_table.verticalHeader().setDefaultSectionSize(34)
         self.remote_table.doubleClicked.connect(self.remote_double_clicked)
+        self.remote_table.customContextMenuRequested.connect(self.show_remote_context_menu)
+        self.remote_table.files_dropped.connect(self.handle_drop_on_remote)
         self.remote_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for column in range(1, 5):
             self.remote_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
@@ -644,13 +701,119 @@ class MainWindow(QMainWindow):
         if entry.type in {FtpEntryType.DIRECTORY, FtpEntryType.LINK}:
             self._list_remote_in_background(lambda: self.session_or_raise().cwd(entry.name))
 
+    @Slot(QPoint)
+    def show_local_context_menu(self, position: QPoint) -> None:
+        self._select_context_row(self.local_table, position)
+        entry = self.selected_local_entry()
+        menu = QMenu(self)
+        open_action = menu.addAction("打开")
+        upload_action = menu.addAction("上传到远端")
+        menu.addSeparator()
+        new_folder_action = menu.addAction("新建目录")
+        rename_action = menu.addAction("重命名")
+        delete_action = menu.addAction("删除")
+        properties_action = menu.addAction("属性")
+        refresh_action = menu.addAction("刷新")
+
+        if not entry:
+            open_action.setEnabled(False)
+            upload_action.setEnabled(False)
+            rename_action.setEnabled(False)
+            delete_action.setEnabled(False)
+            properties_action.setEnabled(False)
+        elif entry.is_parent:
+            upload_action.setEnabled(False)
+            rename_action.setEnabled(False)
+            delete_action.setEnabled(False)
+
+        selected = menu.exec(self.local_table.viewport().mapToGlobal(position))
+        if selected == open_action and entry:
+            self.open_local_entry(entry)
+        elif selected == upload_action:
+            self.upload_file()
+        elif selected == new_folder_action:
+            self.create_local_folder()
+        elif selected == rename_action:
+            self.rename_local_item()
+        elif selected == delete_action:
+            self.delete_local_item()
+        elif selected == properties_action:
+            self.show_local_properties()
+        elif selected == refresh_action:
+            self.render_local_directory(self.current_local_path)
+
+    @Slot(QPoint)
+    def show_remote_context_menu(self, position: QPoint) -> None:
+        self._select_context_row(self.remote_table, position)
+        row = self.remote_table.currentRow()
+        entry = self.selected_remote_entry()
+        menu = QMenu(self)
+        open_action = menu.addAction("打开")
+        download_action = menu.addAction("下载到左侧")
+        menu.addSeparator()
+        new_folder_action = menu.addAction("新建目录")
+        rename_action = menu.addAction("重命名")
+        delete_action = menu.addAction("删除")
+        properties_action = menu.addAction("属性")
+        refresh_action = menu.addAction("刷新")
+
+        if row == 0:
+            download_action.setEnabled(False)
+            rename_action.setEnabled(False)
+            delete_action.setEnabled(False)
+            properties_action.setEnabled(False)
+        elif not entry:
+            open_action.setEnabled(False)
+            download_action.setEnabled(False)
+            rename_action.setEnabled(False)
+            delete_action.setEnabled(False)
+            properties_action.setEnabled(False)
+        elif entry.is_dir:
+            download_action.setEnabled(False)
+
+        selected = menu.exec(self.remote_table.viewport().mapToGlobal(position))
+        if selected == open_action:
+            if row == 0:
+                self.remote_up()
+            elif entry and entry.is_dir:
+                self._list_remote_in_background(lambda: self.session_or_raise().cwd(entry.name))
+        elif selected == download_action:
+            self.download_selected()
+        elif selected == new_folder_action:
+            self.create_remote_folder()
+        elif selected == rename_action:
+            self.rename_remote_item()
+        elif selected == delete_action:
+            self.delete_remote_item()
+        elif selected == properties_action:
+            self.show_remote_properties()
+        elif selected == refresh_action:
+            self.refresh_remote()
+
+    @Slot(str)
+    def handle_drop_on_remote(self, source_panel: str) -> None:
+        if source_panel == "local":
+            self.upload_file()
+
+    @Slot(str)
+    def handle_drop_on_local(self, source_panel: str) -> None:
+        if source_panel == "remote":
+            self.download_selected()
+
     @Slot()
     def upload_file(self) -> None:
         if not self.active_config:
             self._show_message("未连接", "请先连接 FTP 服务器。")
             return
-        path = self.selected_local_path()
+        entry = self.selected_local_entry()
+        path = entry.path if entry else None
+        if entry and entry.is_parent:
+            self._show_message("上传", "请选择具体文件上传，不能上传 '..'。")
+            return
         if path is None or path.is_dir():
+            if path is not None and path.is_dir():
+                self._show_message("上传", "当前版本暂不支持递归上传目录，请选择单个文件。")
+                return
             chosen, _ = QFileDialog.getOpenFileName(self, "选择要上传的文件", self.local_path_label.text())
             if not chosen:
                 return
@@ -727,6 +890,67 @@ class MainWindow(QMainWindow):
             f"原始列表行：{entry.raw}",
         ]
         QMessageBox.information(self, "属性", "\n".join(details))
+
+    def open_local_entry(self, entry: LocalEntry) -> None:
+        if entry.is_parent:
+            self.local_up()
+        elif entry.is_dir:
+            self.render_local_directory(entry.path)
+        else:
+            self.show_local_properties()
+
+    def create_local_folder(self) -> None:
+        name, ok = QInputDialog.getText(self, "新建本地目录", "目录名称：")
+        if not ok or not name.strip():
+            return
+        target = self.current_local_path / name.strip()
+        try:
+            target.mkdir()
+            self.render_local_directory(self.current_local_path)
+        except OSError as exc:
+            self._show_error("新建本地目录失败", exc)
+
+    def rename_local_item(self) -> None:
+        entry = self.selected_local_entry()
+        if not entry or entry.is_parent:
+            return
+        new_name, ok = QInputDialog.getText(self, "重命名本地项目", "新名称：", text=entry.name)
+        if not ok or not new_name.strip() or new_name.strip() == entry.name:
+            return
+        try:
+            entry.path.rename(entry.path.with_name(new_name.strip()))
+            self.render_local_directory(self.current_local_path)
+        except OSError as exc:
+            self._show_error("重命名本地项目失败", exc)
+
+    def delete_local_item(self) -> None:
+        entry = self.selected_local_entry()
+        if not entry or entry.is_parent:
+            return
+        answer = QMessageBox.question(self, "删除", f"确定删除本地项目 '{entry.name}' 吗？")
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            if entry.is_dir:
+                entry.path.rmdir()
+            else:
+                entry.path.unlink()
+            self.render_local_directory(self.current_local_path)
+        except OSError as exc:
+            self._show_error("删除本地项目失败", exc)
+
+    def show_local_properties(self) -> None:
+        entry = self.selected_local_entry()
+        if not entry:
+            return
+        details = [
+            f"名称：{entry.name}",
+            f"路径：{entry.path}",
+            f"类型：{'上级目录' if entry.is_parent else ('目录' if entry.is_dir else '文件')}",
+            f"大小：{format_size(entry.size)}",
+            f"修改时间：{entry.modified or '-'}",
+        ]
+        QMessageBox.information(self, "本地属性", "\n".join(details))
 
     @Slot()
     def save_current_site(self) -> None:
@@ -849,12 +1073,16 @@ class MainWindow(QMainWindow):
         return None
 
     def selected_local_path(self) -> Path | None:
+        entry = self.selected_local_entry()
+        return entry.path if entry else None
+
+    def selected_local_entry(self) -> LocalEntry | None:
         indexes = self.local_table.selectionModel().selectedRows()
         if not indexes:
             return None
         row = indexes[0].row()
         if 0 <= row < len(self.local_entries):
-            return self.local_entries[row].path
+            return self.local_entries[row]
         return None
 
     def selected_task_id(self) -> int | None:
@@ -1021,6 +1249,11 @@ class MainWindow(QMainWindow):
         elif not busy and self._cursor_busy:
             QApplication.restoreOverrideCursor()
             self._cursor_busy = False
+
+    def _select_context_row(self, table: QTableWidget, position: QPoint) -> None:
+        item = table.itemAt(position)
+        if item is not None:
+            table.selectRow(item.row())
 
 
 def remote_join(directory: str, name: str) -> str:
