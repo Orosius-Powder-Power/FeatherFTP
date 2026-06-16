@@ -1,3 +1,14 @@
+"""
+@file test_store.py
+@brief 测试站点配置存储功能的单元测试套件。
+@details
+该文件针对客户端的持久化存储逻辑（SQLite3）进行验证，主要测试：
+- 密码保存策略（默认不保存，可选保存）
+- 站点记录的增删改查（CRUD）操作
+- 防止重复端点（Endpoint）的去重与更新逻辑
+- 数据库表结构变更或数据迁移时的数据一致性
+"""
+
 from __future__ import annotations
 
 import sqlite3

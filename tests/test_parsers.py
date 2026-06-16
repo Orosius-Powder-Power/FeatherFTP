@@ -1,3 +1,14 @@
+"""
+@file test_parsers.py
+@brief 测试 FTP 响应解析器的单元测试套件。
+@details
+该文件负责验证客户端解析服务器响应的能力，涵盖以下功能：
+- 被动模式 (PASV/ESPS) IP 和端口的提取
+- 目录列表解析（支持 Unix、Windows 及 MLSX 格式）
+- 文件属性（大小、时间、类型、权限）的正确映射
+- 特殊条目（如 . 和 ..）的过滤逻辑
+"""
+
 from __future__ import annotations
 
 from datetime import datetime

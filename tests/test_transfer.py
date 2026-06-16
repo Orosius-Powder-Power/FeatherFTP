@@ -1,3 +1,14 @@
+"""
+@file test_transfer.py
+@brief 测试文件传输偏移量计算的单元测试套件。
+@details
+该文件专注于验证断点续传（Resume）逻辑的核心算法。
+测试用例覆盖了下载和上传两种场景，包括：
+- 本地文件缺失或为空的情况
+- 本地/远程文件大小对比（如本地大于远程时重置偏移）
+- 断点续传标志（resume=True/False）对计算结果的影响
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
