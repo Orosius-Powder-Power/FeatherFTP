@@ -1,0 +1,67 @@
+# Python bytecode / caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / coverage / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+
+# Build / packaging outputs
+dist/
+build/
+*.egg-info/
+*.spec
+*.manifest
+*.appx
+*.msix
+*.msi
+*.exe
+
+# Local runtime data
+*.db
+*.sqlite
+*.sqlite3
+*.log
+downloads/
+logs/
+tmp/
+temp/
+
+# Local agent / tool metadata
+.agents/
+.codex/
+
+# External references / cloned comparison projects
+reference/
+
+# IDE files
+.idea/
+.vscode/
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+
+# OS noise
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
