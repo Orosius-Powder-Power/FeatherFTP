@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import threading
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QMimeData, QModelIndex, QObject, QPoint, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QDrag
+from PySide6.QtCore import QMimeData, QModelIndex, QObject, QPoint, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QDesktopServices, QDrag
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -131,6 +132,7 @@ class MainWindow(QMainWindow):
         self.local_entries: list[LocalEntry] = []
         self.current_local_path = Path.home()
         self.task_rows: dict[int, int] = {}
+        self.open_after_download: dict[int, Path] = {}
         self.dark_theme = False
         self.remote_busy = False
         self._cursor_busy = False
@@ -669,10 +671,7 @@ class MainWindow(QMainWindow):
         if index.row() < 0 or index.row() >= len(self.local_entries):
             return
         entry = self.local_entries[index.row()]
-        if entry.is_parent:
-            self.local_up()
-        elif entry.is_dir:
-            self.render_local_directory(entry.path)
+        self.open_local_entry(entry)
 
     @Slot()
     def local_up(self) -> None:
@@ -698,8 +697,7 @@ class MainWindow(QMainWindow):
         if entry_index < 0 or entry_index >= len(self.remote_entries):
             return
         entry = self.remote_entries[entry_index]
-        if entry.type in {FtpEntryType.DIRECTORY, FtpEntryType.LINK}:
-            self._list_remote_in_background(lambda: self.session_or_raise().cwd(entry.name))
+        self.open_remote_entry(entry)
 
     @Slot(QPoint)
     def show_local_context_menu(self, position: QPoint) -> None:
@@ -775,8 +773,8 @@ class MainWindow(QMainWindow):
         if selected == open_action:
             if row == 0:
                 self.remote_up()
-            elif entry and entry.is_dir:
-                self._list_remote_in_background(lambda: self.session_or_raise().cwd(entry.name))
+            elif entry:
+                self.open_remote_entry(entry)
         elif selected == download_action:
             self.download_selected()
         elif selected == new_folder_action:
@@ -897,7 +895,36 @@ class MainWindow(QMainWindow):
         elif entry.is_dir:
             self.render_local_directory(entry.path)
         else:
-            self.show_local_properties()
+            self.open_local_file(entry.path)
+
+    def open_local_file(self, path: Path) -> None:
+        if not path.exists():
+            self._show_message("打开文件", f"文件不存在：{path}")
+            return
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        if opened:
+            self.statusBar().showMessage(f"已用系统默认程序打开：{path.name}")
+        else:
+            self._show_message("打开文件失败", f"系统没有找到可打开该文件的默认程序：{path}")
+
+    def open_remote_entry(self, entry: FtpEntry) -> None:
+        if entry.is_dir or entry.type == FtpEntryType.LINK:
+            self._list_remote_in_background(lambda: self.session_or_raise().cwd(entry.name))
+            return
+        temp_path = self._remote_open_cache_dir() / self._safe_temp_filename(entry.name)
+        remote_path = remote_join(self.remote_path_edit.text(), entry.name)
+        task = self.transfer_manager.enqueue_download(remote_path, temp_path, resume=False)
+        self.open_after_download[task.id] = temp_path
+        self.statusBar().showMessage(f"正在下载并准备打开：{entry.name}")
+
+    def _remote_open_cache_dir(self) -> Path:
+        cache_dir = Path(tempfile.gettempdir()) / "featherftp-open"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    def _safe_temp_filename(self, filename: str) -> str:
+        safe = "".join("_" if char in '<>:"/\\|?*' else char for char in filename).strip()
+        return safe or "remote-file"
 
     def create_local_folder(self) -> None:
         name, ok = QInputDialog.getText(self, "新建本地目录", "目录名称：")
@@ -1054,6 +1081,11 @@ class MainWindow(QMainWindow):
             and task.request.local_path.parent == self.current_local_path
         ):
             self.render_local_directory(self.current_local_path)
+        open_path = self.open_after_download.pop(task.id, None) if task.status == TransferStatus.COMPLETED else None
+        if open_path:
+            self.open_local_file(open_path)
+        elif task.status in {TransferStatus.FAILED, TransferStatus.CANCELLED}:
+            self.open_after_download.pop(task.id, None)
 
     @Slot()
     def toggle_theme(self) -> None:

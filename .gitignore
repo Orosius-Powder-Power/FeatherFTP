@@ -41,6 +41,7 @@ downloads/
 logs/
 tmp/
 temp/
+demo_ftp_root/
 
 # Local agent / tool metadata
 .agents/

@@ -24,7 +24,8 @@ fi
 export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 python -m ftp_client
 
-# WSL 运行：bash scripts/run.sh
+# WSL 运行：1. .venv/bin/python scripts/run_demo_ftp_server.py
+# 2. bash scripts/run.sh
 # Windows PowerShell 运行：
 #   py -m venv .venv
 #   .\.venv\Scripts\Activate.ps1

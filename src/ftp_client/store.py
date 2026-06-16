@@ -49,7 +49,15 @@ class SiteStore:
         password = site.password if site.save_password else ""
         now = datetime.now(UTC).isoformat(timespec="seconds")
         with self._connect() as conn:
-            if site.id is None:
+            site_id = site.id
+            if site_id is None:
+                row = conn.execute(
+                    "SELECT id FROM sites WHERE host=? AND port=? AND username=?",
+                    (site.host, site.port, site.username),
+                ).fetchone()
+                site_id = row["id"] if row else None
+
+            if site_id is None:
                 cursor = conn.execute(
                     "INSERT INTO sites(name, host, port, username, save_password, password, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -64,21 +72,24 @@ class SiteStore:
                     ),
                 )
                 return int(cursor.lastrowid)
-            conn.execute(
-                "UPDATE sites SET name=?, host=?, port=?, username=?, save_password=?, "
-                "password=?, updated_at=? WHERE id=?",
-                (
-                    site.name,
-                    site.host,
-                    site.port,
-                    site.username,
-                    int(site.save_password),
-                    password,
-                    now,
-                    site.id,
-                ),
-            )
-            return site.id
+
+            if site_id is not None:
+                conn.execute(
+                    "UPDATE sites SET name=?, host=?, port=?, username=?, save_password=?, "
+                    "password=?, updated_at=? WHERE id=?",
+                    (
+                        site.name,
+                        site.host,
+                        site.port,
+                        site.username,
+                        int(site.save_password),
+                        password,
+                        now,
+                        site_id,
+                    ),
+                )
+                return int(site_id)
+        raise RuntimeError("Failed to save site")
 
     def delete_site(self, site_id: int) -> None:
         with self._connect() as conn:
@@ -125,6 +136,39 @@ class SiteStore:
                 )
                 """
             )
+            self._dedupe_sites(conn)
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sites_endpoint_user "
+                "ON sites(host, port, username)"
+            )
+
+    def _dedupe_sites(self, conn: sqlite3.Connection) -> None:
+        duplicates = conn.execute(
+            """
+            SELECT host, port, username
+            FROM sites
+            GROUP BY host, port, username
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        for duplicate in duplicates:
+            rows = conn.execute(
+                """
+                SELECT id
+                FROM sites
+                WHERE host=? AND port=? AND username=?
+                ORDER BY updated_at DESC, id DESC
+                """,
+                (duplicate["host"], duplicate["port"], duplicate["username"]),
+            ).fetchall()
+            keep_id = rows[0]["id"]
+            remove_ids = [row["id"] for row in rows[1:]]
+            if remove_ids:
+                placeholders = ",".join("?" for _ in remove_ids)
+                conn.execute(
+                    f"DELETE FROM sites WHERE id IN ({placeholders}) AND id<>?",
+                    (*remove_ids, keep_id),
+                )
 
 
 def default_db_path() -> Path:
