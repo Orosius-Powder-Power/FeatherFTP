@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QMimeData, QModelIndex, QObject, QPoint, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QDesktopServices, QDrag
+from PySide6.QtGui import QAction, QDesktopServices, QDrag, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -56,6 +56,7 @@ class UiBridge(QObject):
     task_changed = Signal(object)
     connection_finished = Signal(object, object, object)
     remote_list_finished = Signal(object, object, object)
+    local_refresh_requested = Signal()
 
 
 @dataclass(slots=True)
@@ -68,8 +69,19 @@ class LocalEntry:
     is_parent: bool = False
 
 
+@dataclass(slots=True)
+class FileClipboard:
+    panel: str
+    action: str
+    name: str
+    is_dir: bool
+    local_path: Path | None = None
+    remote_path: str = ""
+
+
 class FileTableWidget(QTableWidget):
     files_dropped = Signal(str)
+    clipboard_requested = Signal(str, str)
 
     def __init__(self, panel_name: str) -> None:
         super().__init__(0, 0)
@@ -109,6 +121,21 @@ class FileTableWidget(QTableWidget):
         self.files_dropped.emit(source_panel)
         event.acceptProposedAction()
 
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.matches(QKeySequence.Copy):
+            self.clipboard_requested.emit(self.panel_name, "copy")
+            event.accept()
+            return
+        if event.matches(QKeySequence.Cut):
+            self.clipboard_requested.emit(self.panel_name, "cut")
+            event.accept()
+            return
+        if event.matches(QKeySequence.Paste):
+            self.clipboard_requested.emit(self.panel_name, "paste")
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def _accepts_panel_drop(self, event) -> bool:
         if not event.mimeData().hasFormat("application/x-featherftp-panel"):
             return False
@@ -128,6 +155,7 @@ class MainWindow(QMainWindow):
         self.bridge.task_changed.connect(self.update_task_row)
         self.bridge.connection_finished.connect(self.on_connection_finished)
         self.bridge.remote_list_finished.connect(self.on_remote_list_finished)
+        self.bridge.local_refresh_requested.connect(lambda: self.render_local_directory(self.current_local_path))
 
         self.store = SiteStore()
         self.session: FtpSession | None = None
@@ -137,6 +165,11 @@ class MainWindow(QMainWindow):
         self.current_local_path = Path.home()
         self.task_rows: dict[int, int] = {}
         self.open_after_download: dict[int, Path] = {}
+        self.remote_copy_after_download: dict[int, str] = {}
+        self.delete_remote_after_download: dict[int, str] = {}
+        self.cleanup_after_upload: dict[int, Path] = {}
+        self.delete_local_after_upload: dict[int, Path] = {}
+        self.file_clipboard: FileClipboard | None = None
         self.remote_open_cache_dir = default_remote_open_cache_dir()
         self.dark_theme = False
         self.remote_busy = False
@@ -466,6 +499,7 @@ class MainWindow(QMainWindow):
         self.local_table.doubleClicked.connect(self.local_double_clicked)
         self.local_table.customContextMenuRequested.connect(self.show_local_context_menu)
         self.local_table.files_dropped.connect(self.handle_drop_on_local)
+        self.local_table.clipboard_requested.connect(self.handle_clipboard_shortcut)
         self.local_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for column in range(1, 4):
             self.local_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
@@ -504,6 +538,7 @@ class MainWindow(QMainWindow):
         self.remote_table.doubleClicked.connect(self.remote_double_clicked)
         self.remote_table.customContextMenuRequested.connect(self.show_remote_context_menu)
         self.remote_table.files_dropped.connect(self.handle_drop_on_remote)
+        self.remote_table.clipboard_requested.connect(self.handle_clipboard_shortcut)
         self.remote_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for column in range(1, 5):
             self.remote_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
@@ -713,6 +748,10 @@ class MainWindow(QMainWindow):
         open_action = menu.addAction("打开")
         upload_action = menu.addAction("上传到远端")
         menu.addSeparator()
+        copy_action = menu.addAction("复制\tCtrl+C")
+        cut_action = menu.addAction("剪切\tCtrl+X")
+        paste_action = menu.addAction("粘贴\tCtrl+V")
+        menu.addSeparator()
         new_folder_action = menu.addAction("新建目录")
         rename_action = menu.addAction("重命名")
         delete_action = menu.addAction("删除")
@@ -722,19 +761,30 @@ class MainWindow(QMainWindow):
         if not entry:
             open_action.setEnabled(False)
             upload_action.setEnabled(False)
+            copy_action.setEnabled(False)
+            cut_action.setEnabled(False)
             rename_action.setEnabled(False)
             delete_action.setEnabled(False)
             properties_action.setEnabled(False)
         elif entry.is_parent:
             upload_action.setEnabled(False)
+            copy_action.setEnabled(False)
+            cut_action.setEnabled(False)
             rename_action.setEnabled(False)
             delete_action.setEnabled(False)
+        paste_action.setEnabled(self.file_clipboard is not None)
 
         selected = menu.exec(self.local_table.viewport().mapToGlobal(position))
         if selected == open_action and entry:
             self.open_local_entry(entry)
         elif selected == upload_action:
             self.upload_file()
+        elif selected == copy_action:
+            self.copy_selected("local")
+        elif selected == cut_action:
+            self.cut_selected("local")
+        elif selected == paste_action:
+            self.paste_to_panel("local")
         elif selected == new_folder_action:
             self.create_local_folder()
         elif selected == rename_action:
@@ -753,7 +803,11 @@ class MainWindow(QMainWindow):
         entry = self.selected_remote_entry()
         menu = QMenu(self)
         open_action = menu.addAction("打开")
-        download_action = menu.addAction("下载到左侧")
+        download_action = menu.addAction("下载到本地")
+        menu.addSeparator()
+        copy_action = menu.addAction("复制\tCtrl+C")
+        cut_action = menu.addAction("剪切\tCtrl+X")
+        paste_action = menu.addAction("粘贴\tCtrl+V")
         menu.addSeparator()
         new_folder_action = menu.addAction("新建目录")
         rename_action = menu.addAction("重命名")
@@ -763,17 +817,22 @@ class MainWindow(QMainWindow):
 
         if row == 0:
             download_action.setEnabled(False)
+            copy_action.setEnabled(False)
+            cut_action.setEnabled(False)
             rename_action.setEnabled(False)
             delete_action.setEnabled(False)
             properties_action.setEnabled(False)
         elif not entry:
             open_action.setEnabled(False)
             download_action.setEnabled(False)
+            copy_action.setEnabled(False)
+            cut_action.setEnabled(False)
             rename_action.setEnabled(False)
             delete_action.setEnabled(False)
             properties_action.setEnabled(False)
         elif entry.is_dir:
             download_action.setEnabled(False)
+        paste_action.setEnabled(self.file_clipboard is not None)
 
         selected = menu.exec(self.remote_table.viewport().mapToGlobal(position))
         if selected == open_action:
@@ -783,6 +842,12 @@ class MainWindow(QMainWindow):
                 self.open_remote_entry(entry)
         elif selected == download_action:
             self.download_selected()
+        elif selected == copy_action:
+            self.copy_selected("remote")
+        elif selected == cut_action:
+            self.cut_selected("remote")
+        elif selected == paste_action:
+            self.paste_to_panel("remote")
         elif selected == new_folder_action:
             self.create_remote_folder()
         elif selected == rename_action:
@@ -803,6 +868,15 @@ class MainWindow(QMainWindow):
     def handle_drop_on_local(self, source_panel: str) -> None:
         if source_panel == "remote":
             self.download_selected()
+
+    @Slot(str, str)
+    def handle_clipboard_shortcut(self, panel: str, action: str) -> None:
+        if action == "copy":
+            self.copy_selected(panel)
+        elif action == "cut":
+            self.cut_selected(panel)
+        elif action == "paste":
+            self.paste_to_panel(panel)
 
     @Slot()
     def upload_file(self) -> None:
@@ -894,6 +968,151 @@ class MainWindow(QMainWindow):
             f"原始列表行：{entry.raw}",
         ]
         QMessageBox.information(self, "属性", "\n".join(details))
+
+    def copy_selected(self, panel: str) -> None:
+        self._set_file_clipboard(panel, "copy")
+
+    def cut_selected(self, panel: str) -> None:
+        self._set_file_clipboard(panel, "cut")
+
+    def _set_file_clipboard(self, panel: str, action: str) -> None:
+        if panel == "local":
+            entry = self.selected_local_entry()
+            if not entry or entry.is_parent:
+                return
+            self.file_clipboard = FileClipboard(
+                panel="local",
+                action=action,
+                name=entry.name,
+                is_dir=entry.is_dir,
+                local_path=entry.path,
+            )
+        else:
+            entry = self.selected_remote_entry()
+            if not entry:
+                return
+            self.file_clipboard = FileClipboard(
+                panel="remote",
+                action=action,
+                name=entry.name,
+                is_dir=entry.is_dir,
+                remote_path=remote_join(self.remote_path_edit.text(), entry.name),
+            )
+        label = "复制" if action == "copy" else "剪切"
+        self.statusBar().showMessage(f"已{label}：{self.file_clipboard.name}")
+
+    def paste_to_panel(self, target_panel: str) -> None:
+        clip = self.file_clipboard
+        if not clip:
+            return
+        if target_panel == "local":
+            self._paste_to_local(clip)
+        else:
+            self._paste_to_remote(clip)
+
+    def _paste_to_local(self, clip: FileClipboard) -> None:
+        if clip.panel == "local":
+            self._paste_local_to_local(clip)
+            return
+        if clip.is_dir:
+            self._show_message("粘贴", "当前版本暂不支持递归下载远端目录，请选择远端文件。")
+            return
+        target = unique_local_destination(self.current_local_path / clip.name)
+        task = self.transfer_manager.enqueue_download(clip.remote_path, target, resume=False)
+        if clip.action == "cut":
+            self.delete_remote_after_download[task.id] = clip.remote_path
+            self.file_clipboard = None
+        self.statusBar().showMessage(f"已加入下载粘贴任务：{clip.name}")
+
+    def _paste_local_to_local(self, clip: FileClipboard) -> None:
+        if not clip.local_path:
+            return
+        source = clip.local_path
+        if not source.exists():
+            self._show_message("粘贴", f"源项目不存在：{source}")
+            self.file_clipboard = None
+            return
+        if clip.action == "cut" and source.parent.resolve() == self.current_local_path.resolve():
+            self.statusBar().showMessage("剪切源和目标目录相同，未执行移动。")
+            return
+        target = unique_local_destination(self.current_local_path / source.name)
+
+        def worker() -> None:
+            try:
+                if clip.action == "cut":
+                    shutil.move(str(source), str(target))
+                elif source.is_dir():
+                    shutil.copytree(source, target)
+                else:
+                    shutil.copy2(source, target)
+                self.bridge.log_received.emit("!", f"LOCAL {clip.action.upper()} {source} -> {target}")
+            except Exception as exc:
+                self.bridge.log_received.emit("!", f"LOCAL PASTE FAILED {source}: {exc}")
+            self.bridge.local_refresh_requested.emit()
+
+        threading.Thread(target=worker, name="local-paste", daemon=True).start()
+        if clip.action == "cut":
+            self.file_clipboard = None
+        self.statusBar().showMessage(f"正在本地粘贴：{source.name}")
+
+    def _paste_to_remote(self, clip: FileClipboard) -> None:
+        if not self.active_config:
+            self._show_message("粘贴", "请先连接 FTP 服务器。")
+            return
+        if clip.panel == "local":
+            self._paste_local_to_remote(clip)
+        else:
+            self._paste_remote_to_remote(clip)
+
+    def _paste_local_to_remote(self, clip: FileClipboard) -> None:
+        if not clip.local_path:
+            return
+        if clip.is_dir:
+            self._show_message("粘贴", "当前版本暂不支持递归上传目录，请选择本地文件。")
+            return
+        remote_path = remote_join(self.remote_path_edit.text(), clip.name)
+        task = self.transfer_manager.enqueue_upload(clip.local_path, remote_path, resume=False)
+        if clip.action == "cut":
+            self.delete_local_after_upload[task.id] = clip.local_path
+            self.file_clipboard = None
+        self.statusBar().showMessage(f"已加入上传粘贴任务：{clip.name}")
+
+    def _paste_remote_to_remote(self, clip: FileClipboard) -> None:
+        target = remote_join(self.remote_path_edit.text(), clip.name)
+        if clip.remote_path == target:
+            if clip.action == "cut":
+                self.statusBar().showMessage("剪切源和目标相同，未执行移动。")
+                return
+            target = remote_join(self.remote_path_edit.text(), duplicate_remote_name(clip.name))
+        if clip.action == "cut":
+            self._rename_remote_in_background(clip.remote_path, target)
+            self.file_clipboard = None
+            return
+        if clip.is_dir:
+            self._show_message("粘贴", "标准 FTP 不支持服务器端目录复制，当前版本暂不支持远端目录复制。")
+            return
+        temp_path = unique_local_destination(self._remote_open_cache_dir() / clip.name)
+        task = self.transfer_manager.enqueue_download(clip.remote_path, temp_path, resume=False)
+        self.remote_copy_after_download[task.id] = target
+        self.statusBar().showMessage(f"正在准备远端复制：{clip.name}")
+
+    def _rename_remote_in_background(self, source: str, target: str) -> None:
+        self._set_remote_busy(True, "正在移动远端项目 ...")
+
+        def worker() -> None:
+            error: Exception | None = None
+            entries: list[FtpEntry] | None = None
+            path = ""
+            try:
+                session = self.session_or_raise()
+                session.rename(source, target)
+                entries = session.list()
+                path = session.current_directory
+            except Exception as exc:
+                error = exc
+            self.bridge.remote_list_finished.emit(entries, path, error)
+
+        threading.Thread(target=worker, name="ftp-remote-move", daemon=True).start()
 
     def open_local_entry(self, entry: LocalEntry) -> None:
         if entry.is_parent:
@@ -1099,11 +1318,85 @@ class MainWindow(QMainWindow):
             self.open_local_file(open_path)
         elif task.status in {TransferStatus.FAILED, TransferStatus.CANCELLED}:
             self.open_after_download.pop(task.id, None)
+            self.remote_copy_after_download.pop(task.id, None)
+            self.delete_remote_after_download.pop(task.id, None)
+            self.cleanup_after_upload.pop(task.id, None)
+            self.delete_local_after_upload.pop(task.id, None)
+        if task.status == TransferStatus.COMPLETED:
+            upload_target = self.remote_copy_after_download.pop(task.id, None)
+            if upload_target:
+                upload_task = self.transfer_manager.enqueue_upload(task.request.local_path, upload_target, resume=False)
+                self.cleanup_after_upload[upload_task.id] = task.request.local_path
+                self.statusBar().showMessage(f"远端复制继续上传：{upload_target}")
+            remote_to_delete = self.delete_remote_after_download.pop(task.id, None)
+            if remote_to_delete:
+                self._delete_remote_after_success(remote_to_delete)
+            local_to_delete = self.delete_local_after_upload.pop(task.id, None)
+            if local_to_delete:
+                self._delete_local_after_success(local_to_delete)
+            temp_to_cleanup = self.cleanup_after_upload.pop(task.id, None)
+            if temp_to_cleanup:
+                try:
+                    temp_to_cleanup.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     @Slot()
     def toggle_theme(self) -> None:
         self.dark_theme = not self.dark_theme
         self._apply_theme()
+
+    def _delete_remote_after_success(self, remote_path: str) -> None:
+        def worker() -> None:
+            error: Exception | None = None
+            entries: list[FtpEntry] | None = None
+            path = ""
+            try:
+                session = self.session_or_raise()
+                session.delete(remote_path)
+                entries = session.list()
+                path = session.current_directory
+            except Exception as exc:
+                error = exc
+            self.bridge.remote_list_finished.emit(entries, path, error)
+
+        threading.Thread(target=worker, name="ftp-delete-after-cut", daemon=True).start()
+
+    def _delete_local_after_success(self, path: Path) -> None:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+            self.render_local_directory(self.current_local_path)
+        except OSError as exc:
+            self._show_error("剪切源文件删除失败", exc)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        panel = self._focused_file_panel()
+        if panel and event.matches(QKeySequence.Copy):
+            self.copy_selected(panel)
+            event.accept()
+            return
+        if panel and event.matches(QKeySequence.Cut):
+            self.cut_selected(panel)
+            event.accept()
+            return
+        if panel and event.matches(QKeySequence.Paste):
+            self.paste_to_panel(panel)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _focused_file_panel(self) -> str | None:
+        widget = QApplication.focusWidget()
+        if not widget or isinstance(widget, (QLineEdit, QTextEdit)):
+            return None
+        if widget is self.local_table or widget is self.local_table.viewport() or self.local_table.isAncestorOf(widget):
+            return "local"
+        if widget is self.remote_table or widget is self.remote_table.viewport() or self.remote_table.isAncestorOf(widget):
+            return "remote"
+        return None
 
     def selected_remote_entry(self) -> FtpEntry | None:
         indexes = self.remote_table.selectionModel().selectedRows()
@@ -1495,6 +1788,32 @@ def wsl_to_windows_path(path: Path) -> str:
 
 def quote_powershell_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def unique_local_destination(path: Path) -> Path:
+    if not path.exists():
+        return path
+    if path.suffix:
+        base = path.with_name(f"{path.stem} - copy{path.suffix}")
+    else:
+        base = path.with_name(f"{path.name} - copy")
+    if not base.exists():
+        return base
+    for index in range(2, 1000):
+        if path.suffix:
+            candidate = path.with_name(f"{path.stem} - copy ({index}){path.suffix}")
+        else:
+            candidate = path.with_name(f"{path.name} - copy ({index})")
+        if not candidate.exists():
+            return candidate
+    raise OSError(f"无法为 {path.name} 生成可用的副本名称")
+
+
+def duplicate_remote_name(name: str) -> str:
+    path = Path(name)
+    if path.suffix:
+        return f"{path.stem} - copy{path.suffix}"
+    return f"{name} - copy"
 
 
 def remote_join(directory: str, name: str) -> str:
