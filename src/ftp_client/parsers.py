@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+
 import calendar
 import re
 from datetime import datetime
+
 
 from .errors import FtpProtocolError
 from .models import FtpEntry, FtpEntryType
@@ -119,7 +121,8 @@ def parse_directory_listing(text: str, prefer_mlsx: bool = False) -> list[FtpEnt
         line = raw_line.strip("\r\n")
         if not line:
             continue
-        entry = parse_mlsx_line(line) if prefer_mlsx and " " in line else parse_list_line(line)
+        entry = parse_mlsx_line(
+            line) if prefer_mlsx and " " in line else parse_list_line(line)
         if entry.name not in {".", ".."}:
             entries.append(entry)
     return entries
